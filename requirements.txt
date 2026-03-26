@@ -1,0 +1,3 @@
+feedparser
+requests
+sgmllib3k
