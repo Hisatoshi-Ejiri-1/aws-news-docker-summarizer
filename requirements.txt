@@ -1,3 +1,4 @@
-feedparser
-requests
-sgmllib3k
+feedparser==6.0.14
+sgmllib3k==1.0.0
+requests==2.34.2
+boto3==1.43.108
