@@ -31,7 +31,9 @@ resource "aws_dynamodb_table" "sent_articles" {
 
 # ---- SSM Parameter Store：Slack の Webhook URL ----
 resource "aws_ssm_parameter" "slack_webhook_url" {
-  name        = "/${var.project_name}/slack-webhook-url"
+  # 名前が "aws" で始まるパラメータは AWS の予約名なので作れない。
+  # project_name（aws-news-summarizer）をそのまま使わず、先頭の "aws-" を外す
+  name        = "/news-summarizer/slack-webhook-url"
   description = "Slack Incoming Webhook URL"
 
   # SecureString：KMS で暗号化して保存される。
