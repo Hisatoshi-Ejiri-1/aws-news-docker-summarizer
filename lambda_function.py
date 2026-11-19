@@ -10,19 +10,25 @@ AWSの新着情報（What's New）を1日1回取得し、
     4. Slack に1通にまとめて送信する
     5. 送信に成功した記事だけを DynamoDB に「送信済み」として記録する
 
-失敗したときは例外をそのまま投げる。
+縮退運転（v3で追加）:
+    要約（Bedrock）に失敗しても、処理全体は止めない。
+    要約できなかった記事はタイトルと URL だけを送り、
+    Slack のメッセージ先頭に「要約に失敗した」ことを書いて、普段見る場所で気づけるようにする。
+    （2026年10月、Bedrock の利用停止で1か月間1件も届かなかった障害への対策）
+
+それ以外の失敗（RSS の取得、Slack への送信など）は例外をそのまま投げる。
 → Lambda が「エラー」として記録され、CloudWatch アラームで気づける。
 → 送信済みの記録は5の時点で初めて書くので、失敗した記事は次回もう一度送られる。
 """
 
 import html
-import json
 import logging
 import os
 import re
 import time
 
 import boto3
+from botocore.config import Config
 import feedparser
 import requests
 
@@ -36,7 +42,8 @@ FEED_URL = os.environ.get(
 TABLE_NAME = os.environ["TABLE_NAME"]  # 送信済み記事を記録する DynamoDB テーブル
 SLACK_WEBHOOK_PARAM = os.environ["SLACK_WEBHOOK_PARAM"]  # Webhook URL を入れた SSM パラメータ名
 MODEL_ID = os.environ.get("MODEL_ID", "jp.anthropic.claude-haiku-4-5-20251001-v1:0")
-MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "10"))  # 1回に要約・送信する最大件数
+MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "10"))  # 1回に要約する最大件数
+MAX_LIST_ITEMS = 50  # 要約しない記事を、タイトルと URL だけで一覧にする最大件数
 TTL_DAYS = 90  # 送信済み記録を自動で消すまでの日数
 
 HTTP_TIMEOUT = 10  # 秒。外部への通信が固まって Lambda が止まり続けるのを防ぐ
@@ -45,7 +52,11 @@ HTTP_TIMEOUT = 10  # 秒。外部への通信が固まって Lambda が止まり
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 ssm = boto3.client("ssm")
-bedrock = boto3.client("bedrock-runtime")
+# Bedrock が応答しないときに Lambda のタイムアウト（120秒）まで待ち続けないよう、短めに打ち切る
+bedrock = boto3.client(
+    "bedrock-runtime",
+    config=Config(connect_timeout=5, read_timeout=20, retries={"max_attempts": 2}),
+)
 
 _webhook_url_cache = None
 
@@ -111,13 +122,35 @@ def summarize(entry):
     return res["output"]["message"]["content"][0]["text"].strip()
 
 
-def build_message(items, skipped_count):
-    """Slack に送る1通分のメッセージを組み立てる。"""
-    lines = [f"*AWS新着情報（{len(items)}件）*"]
+def format_entry(entry, summary=None):
+    """記事1件分の行。要約がなければタイトルと URL だけにする。"""
+    line = f"• <{entry.get('link')}|{entry.get('title')}>"
+    return f"{line}\n{summary}" if summary else line
+
+
+def build_message(items, others, summary_failed):
+    """Slack に送る1通分のメッセージを組み立てる。
+
+    items: 要約を試みた記事（entry, summary）のリスト。要約に失敗した記事は summary が None
+    others: 件数の上限を超えたため、要約しなかった記事のリスト
+    summary_failed: 要約に失敗したかどうか
+    """
+    lines = []
+    if summary_failed:
+        lines.append(
+            ":warning: *要約に失敗したため、一部またはすべての記事をタイトルと URL のみで送っています。*"
+            "\nCloudWatch Logs を確認してください。\n"
+        )
+    lines.append(f"*AWS新着情報（{len(items) + len(others)}件）*")
     for entry, summary in items:
-        lines.append(f"\n• <{entry.get('link')}|{entry.get('title')}>\n{summary}")
-    if skipped_count:
-        lines.append(f"\n※ ほかに {skipped_count} 件の新着がありました（要約は省略）")
+        lines.append("\n" + format_entry(entry, summary))
+
+    if others:
+        shown = others[:MAX_LIST_ITEMS]
+        lines.append(f"\n*ほかの新着（{len(others)}件、要約なし）*")
+        lines.extend(format_entry(entry) for entry in shown)
+        if len(others) > len(shown):
+            lines.append(f"ほか {len(others) - len(shown)} 件")
     return "\n".join(lines)
 
 
@@ -137,6 +170,27 @@ def mark_sent(entries):
             batch.put_item(Item={"article_id": entry_id(entry), "expires_at": expires_at})
 
 
+def summarize_all(entries):
+    """記事を1件ずつ要約する。失敗しても止めずに、要約なし（None）として扱う。
+
+    1件でも失敗したら、残りの記事は要約を試みない。
+    Bedrock 自体が使えない（利用停止、障害など）ときは残りもほぼ確実に失敗するので、
+    無駄な呼び出しで時間を使わず、タイトルと URL だけを早く届けるため。
+    """
+    items = []
+    failed = False
+    for entry in entries:
+        summary = None
+        if not failed:
+            try:
+                summary = summarize(entry)
+            except Exception:
+                failed = True
+                logger.exception("要約に失敗しました。残りの記事はタイトルと URL のみで送ります: %s", entry.get("link"))
+        items.append((entry, summary))
+    return items, failed
+
+
 def lambda_handler(event, context):
     entries = fetch_entries()
     unsent = filter_unsent(entries)
@@ -146,10 +200,15 @@ def lambda_handler(event, context):
         return {"sent": 0}
 
     targets = unsent[:MAX_ITEMS]
-    items = [(entry, summarize(entry)) for entry in targets]
-    send_slack(build_message(items, skipped_count=len(unsent) - len(targets)))
+    others = unsent[MAX_ITEMS:]
+    items, summary_failed = summarize_all(targets)
+    send_slack(build_message(items, others, summary_failed))
 
-    # 要約を省略した分も「送信済み」にする（件数としては通知済みのため）
+    # Slack への送信に成功したので、すべて送信済みとして記録する
     mark_sent(unsent)
-    logger.info("%d 件を送信しました", len(targets))
-    return {"sent": len(targets), "skipped": len(unsent) - len(targets)}
+    summarized = sum(1 for _, summary in items if summary)
+    if summary_failed:
+        logger.warning("縮退運転で送信しました（要約 %d 件 / 全 %d 件）", summarized, len(unsent))
+    else:
+        logger.info("%d 件を送信しました（要約 %d 件）", len(unsent), summarized)
+    return {"sent": len(unsent), "summarized": summarized, "degraded": summary_failed}
